@@ -20,6 +20,8 @@ import (
 	"math/rand"
 	"net"
 	"net/http"
+	"regexp"
+	"strconv"
 	"time"
 
 	"golang.org/x/net/context"
@@ -195,6 +197,7 @@ type App struct {
 	RunningTasks int               `json:"tasksRunning"`
 	Labels       map[string]string `json:"labels"`
 	Container    Container         `json:"container"`
+	Env          map[string]string `json:"env"`
 }
 
 // AppList is a list of Marathon apps.
@@ -217,7 +220,29 @@ func fetchApps(client *http.Client, url string) (*AppList, error) {
 		return nil, err
 	}
 
-	return parseAppJSON(body)
+	// return parseAppJSON(body)
+	rawAppList, err := parseAppJSON(body)
+	if err != nil {
+		log.Error("Error parsing app JSON body: ", err)
+	}
+
+	curatedAppList := make([]App, 0)
+
+	// Make sure we only return apps which have a valid PROMETHEUS_ENDPOINT env var present
+	for _, app := range rawAppList.Apps {
+		// Check if there is a PROMETHEUS_ENDPOINT env key
+		if _, ok := app.Env["PROMETHEUS_ENDPOINT"]; !ok {
+			continue
+		}
+
+		// Check that it contains a valid value
+		if matched, err := regexp.MatchString("^:[0-9]{1,1}/[a-zA-z0-9]*$", app.Env["PROMETHEUS_ENDPOINT"]); !matched || err != nil {
+			log.Error("invalid PROMETHEUS_ENDPOINT:", app.Env["PROMETHEUS_ENDPOINT"])
+			continue
+		}
+		curatedAppList = append(curatedAppList, app)
+	}
+	return &AppList{Apps: curatedAppList}, nil
 }
 
 func parseAppJSON(body []byte) (*AppList, error) {
@@ -272,19 +297,29 @@ func createTargetGroup(app *App) *config.TargetGroup {
 
 func targetsForApp(app *App) []model.LabelSet {
 	targets := make([]model.LabelSet, 0, len(app.Tasks))
+
+	// TODO : extract this into optional configuration item
+	prometheusEndpoint := app.Env["PROMETHEUS_ENDPOINT"]
+	regexSubMatches := regexp.MustCompile("^:([0-9]{1,1})(/[a-zA-z0-9]*)$").FindStringSubmatch(prometheusEndpoint)
+	prometheusEndpointPortIndex, _ := strconv.Atoi(regexSubMatches[1])
+	prometheusEndpointPath := regexSubMatches[2]
+
 	for _, t := range app.Tasks {
 		if len(t.Ports) == 0 {
 			continue
 		}
-		target := targetForTask(&t)
+		target := targetForTask(&t, prometheusEndpointPortIndex)
 		targets = append(targets, model.LabelSet{
-			model.AddressLabel: model.LabelValue(target),
-			taskLabel:          model.LabelValue(t.ID),
+			model.AddressLabel:     model.LabelValue(target),
+			model.MetricsPathLabel: model.LabelValue(prometheusEndpointPath),
+			taskLabel:              model.LabelValue(t.ID),
+			"task_id":              model.LabelValue(t.ID),
+			"app":                  model.LabelValue(app.ID),
 		})
 	}
 	return targets
 }
 
-func targetForTask(task *Task) string {
-	return net.JoinHostPort(task.Host, fmt.Sprintf("%d", task.Ports[0]))
+func targetForTask(task *Task, prometheusEndpointPortIndex int) string {
+	return net.JoinHostPort(task.Host, fmt.Sprintf("%d", task.Ports[prometheusEndpointPortIndex]))
 }
