@@ -46,9 +46,6 @@ const (
 	// taskLabel contains the mesos task name of the app instance.
 	taskLabel model.LabelName = metaLabelPrefix + "task"
 
-	// metricsListener validation regex, for the value it points to
-	metricsListenerValidationRegex = "^:([0-9]{1,1})(/[a-zA-Z0-9_]*)$"
-
 	// default port index for metrics collection
 	metricsListenerDefaultPortIndex = 0
 	// default path for metrics collection
@@ -71,6 +68,9 @@ var (
 			Name:      "sd_marathon_refresh_duration_seconds",
 			Help:      "The duration of a Marathon-SD refresh in seconds.",
 		})
+
+	// metricsListener validation regex, for the value it points to
+	metricsListenerValidation = regexp.MustCompile("^:([0-9]{1,1})(/[a-zA-Z0-9_]*)$")
 )
 
 func init() {
@@ -231,10 +231,9 @@ func fetchApps(client *http.Client, url, metricsListener string) (*AppList, erro
 		return nil, err
 	}
 
-	// return parseAppJSON(body)
 	rawAppList, err := parseAppJSON(body)
 	if err != nil {
-		log.Error("Error parsing app JSON body: ", err)
+		return nil, err
 	}
 
 	// If no metricsListener value is configured, return the raw list immediately
@@ -251,12 +250,9 @@ func fetchApps(client *http.Client, url, metricsListener string) (*AppList, erro
 		}
 
 		// Check that ENV key contains a valid value
-		// TODO : extract this into a constant
-		re := regexp.MustCompile(metricsListenerValidationRegex)
-		reMatch := re.MatchString(app.Env[metricsListener])
+		reMatch := metricsListenerValidation.MatchString(app.Env[metricsListener])
 		if !reMatch {
-			log.Error("invalid metricsListener ENV value detected:", app.Env[metricsListener])
-			log.Error("skipping this app:", app.ID)
+			log.Warnf("skipping '%s' because of invalid metricsListener ENV value: %s", app.Env[metricsListener])
 			continue
 		}
 		curatedAppList = append(curatedAppList, app)
@@ -316,17 +312,13 @@ func createTargetGroup(app *App, metricsListener string) *config.TargetGroup {
 
 func targetsForApp(app *App, metricsListener string) []model.LabelSet {
 	targets := make([]model.LabelSet, 0, len(app.Tasks))
-	var metricsPortIndex int
-	var metricsPath string
 
-	if metricsListener == "" {
-		metricsPortIndex = metricsListenerDefaultPortIndex
-		metricsPath = metricsListenerDefaultPath
-	} else {
+	metricsPortIndex := metricsListenerDefaultPortIndex
+	metricsPath := metricsListenerDefaultPath
+
+	if metricsListener != "" {
 		metricsListenerValue := app.Env[metricsListener]
-		// TODO : extract this into a constant
-		re := regexp.MustCompile(metricsListenerValidationRegex)
-		regexSubMatches := re.FindStringSubmatch(metricsListenerValue)
+		regexSubMatches := metricsListenerValidation.FindStringSubmatch(metricsListenerValue)
 
 		metricsPortIndex, _ = strconv.Atoi(regexSubMatches[1])
 		metricsPath = regexSubMatches[2]
@@ -338,13 +330,9 @@ func targetsForApp(app *App, metricsListener string) []model.LabelSet {
 		}
 		target := targetForTask(&t, metricsPortIndex)
 		targets = append(targets, model.LabelSet{
-			model.AddressLabel: model.LabelValue(target),
-			// TODO : extract this into optional configuration item
+			model.AddressLabel:     model.LabelValue(target),
 			model.MetricsPathLabel: model.LabelValue(metricsPath),
 			taskLabel:              model.LabelValue(t.ID),
-			// TODO : extract this into relabling config instead
-			"task_id": model.LabelValue(t.ID),
-			"app":     model.LabelValue(app.ID),
 		})
 	}
 	return targets
