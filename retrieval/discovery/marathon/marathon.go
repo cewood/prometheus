@@ -46,6 +46,14 @@ const (
 	// taskLabel contains the mesos task name of the app instance.
 	taskLabel model.LabelName = metaLabelPrefix + "task"
 
+	// metricsListener validation regex, for the value it points to
+	metricsListenerValidationRegex = "^:([0-9]{1,1})(/[a-zA-Z0-9_]*)$"
+
+	// default port index for metrics collection
+	metricsListenerDefaultPortIndex = 0
+	// default path for metrics collection
+	metricsListenerDefaultPath = "/metrics"
+
 	// Constants for instrumentation.
 	namespace = "prometheus"
 )
@@ -71,6 +79,7 @@ func init() {
 }
 
 const appListPath string = "/v2/apps/?embed=apps.tasks"
+const metricsListenerDefault string = ":0/"
 
 // Discovery provides service discovery based on a Marathon instance.
 type Discovery struct {
@@ -79,6 +88,7 @@ type Discovery struct {
 	refreshInterval time.Duration
 	lastRefresh     map[string]*config.TargetGroup
 	appsClient      AppListClient
+	metricsListener string
 }
 
 // Initialize sets up the discovery for usage.
@@ -100,6 +110,7 @@ func NewDiscovery(conf *config.MarathonSDConfig) (*Discovery, error) {
 		servers:         conf.Servers,
 		refreshInterval: time.Duration(conf.RefreshInterval),
 		appsClient:      fetchApps,
+		metricsListener: conf.MetricsListener,
 	}, nil
 }
 
@@ -164,12 +175,12 @@ func (md *Discovery) updateServices(ctx context.Context, ch chan<- []*config.Tar
 
 func (md *Discovery) fetchTargetGroups() (map[string]*config.TargetGroup, error) {
 	url := RandomAppsURL(md.servers)
-	apps, err := md.appsClient(md.client, url)
+	apps, err := md.appsClient(md.client, url, md.metricsListener)
 	if err != nil {
 		return nil, err
 	}
 
-	groups := AppsToTargetGroups(apps)
+	groups := AppsToTargetGroups(apps, md.metricsListener)
 	return groups, nil
 }
 
@@ -206,10 +217,10 @@ type AppList struct {
 }
 
 // AppListClient defines a function that can be used to get an application list from marathon.
-type AppListClient func(client *http.Client, url string) (*AppList, error)
+type AppListClient func(client *http.Client, url, metricsListener string) (*AppList, error)
 
 // fetchApps requests a list of applications from a marathon server.
-func fetchApps(client *http.Client, url string) (*AppList, error) {
+func fetchApps(client *http.Client, url, metricsListener string) (*AppList, error) {
 	resp, err := client.Get(url)
 	if err != nil {
 		return nil, err
@@ -226,18 +237,26 @@ func fetchApps(client *http.Client, url string) (*AppList, error) {
 		log.Error("Error parsing app JSON body: ", err)
 	}
 
-	curatedAppList := make([]App, 0)
+	// If no metricsListener value is configured, return the raw list immediately
+	if metricsListener == "" {
+		return rawAppList, nil
+	}
 
-	// Make sure we only return apps which have a valid PROMETHEUS_ENDPOINT env var present
+	curatedAppList := make([]App, 0)
+	// Make sure we only return apps which have a valid metricsListener ENV var present
 	for _, app := range rawAppList.Apps {
-		// Check if there is a PROMETHEUS_ENDPOINT env key
-		if _, ok := app.Env["PROMETHEUS_ENDPOINT"]; !ok {
+		// Check if metricsListener points to a valid ENV key
+		if _, ok := app.Env[metricsListener]; !ok {
 			continue
 		}
 
-		// Check that it contains a valid value
-		if matched, err := regexp.MatchString("^:[0-9]{1,1}/[a-zA-z0-9]*$", app.Env["PROMETHEUS_ENDPOINT"]); !matched || err != nil {
-			log.Error("invalid PROMETHEUS_ENDPOINT:", app.Env["PROMETHEUS_ENDPOINT"])
+		// Check that ENV key contains a valid value
+		// TODO : extract this into a constant
+		re := regexp.MustCompile(metricsListenerValidationRegex)
+		reMatch := re.MatchString(app.Env[metricsListener])
+		if !reMatch {
+			log.Error("invalid metricsListener ENV value detected:", app.Env[metricsListener])
+			log.Error("skipping this app:", app.ID)
 			continue
 		}
 		curatedAppList = append(curatedAppList, app)
@@ -263,18 +282,18 @@ func RandomAppsURL(servers []string) string {
 }
 
 // AppsToTargetGroups takes an array of Marathon apps and converts them into target groups.
-func AppsToTargetGroups(apps *AppList) map[string]*config.TargetGroup {
+func AppsToTargetGroups(apps *AppList, metricsListener string) map[string]*config.TargetGroup {
 	tgroups := map[string]*config.TargetGroup{}
 	for _, a := range apps.Apps {
-		group := createTargetGroup(&a)
+		group := createTargetGroup(&a, metricsListener)
 		tgroups[group.Source] = group
 	}
 	return tgroups
 }
 
-func createTargetGroup(app *App) *config.TargetGroup {
+func createTargetGroup(app *App, metricsListener string) *config.TargetGroup {
 	var (
-		targets = targetsForApp(app)
+		targets = targetsForApp(app, metricsListener)
 		appName = model.LabelValue(app.ID)
 		image   = model.LabelValue(app.Container.Docker.Image)
 	)
@@ -295,26 +314,37 @@ func createTargetGroup(app *App) *config.TargetGroup {
 	return tg
 }
 
-func targetsForApp(app *App) []model.LabelSet {
+func targetsForApp(app *App, metricsListener string) []model.LabelSet {
 	targets := make([]model.LabelSet, 0, len(app.Tasks))
+	var metricsPortIndex int
+	var metricsPath string
 
-	// TODO : extract this into optional configuration item
-	prometheusEndpoint := app.Env["PROMETHEUS_ENDPOINT"]
-	regexSubMatches := regexp.MustCompile("^:([0-9]{1,1})(/[a-zA-z0-9]*)$").FindStringSubmatch(prometheusEndpoint)
-	prometheusEndpointPortIndex, _ := strconv.Atoi(regexSubMatches[1])
-	prometheusEndpointPath := regexSubMatches[2]
+	if metricsListener == "" {
+		metricsPortIndex = metricsListenerDefaultPortIndex
+		metricsPath = metricsListenerDefaultPath
+	} else {
+		metricsListenerValue := app.Env[metricsListener]
+		// TODO : extract this into a constant
+		re := regexp.MustCompile(metricsListenerValidationRegex)
+		regexSubMatches := re.FindStringSubmatch(metricsListenerValue)
+
+		metricsPortIndex, _ = strconv.Atoi(regexSubMatches[1])
+		metricsPath = regexSubMatches[2]
+	}
 
 	for _, t := range app.Tasks {
 		if len(t.Ports) == 0 {
 			continue
 		}
-		target := targetForTask(&t, prometheusEndpointPortIndex)
+		target := targetForTask(&t, metricsPortIndex)
 		targets = append(targets, model.LabelSet{
-			model.AddressLabel:     model.LabelValue(target),
-			model.MetricsPathLabel: model.LabelValue(prometheusEndpointPath),
+			model.AddressLabel: model.LabelValue(target),
+			// TODO : extract this into optional configuration item
+			model.MetricsPathLabel: model.LabelValue(metricsPath),
 			taskLabel:              model.LabelValue(t.ID),
-			"task_id":              model.LabelValue(t.ID),
-			"app":                  model.LabelValue(app.ID),
+			// TODO : extract this into relabling config instead
+			"task_id": model.LabelValue(t.ID),
+			"app":     model.LabelValue(app.ID),
 		})
 	}
 	return targets
