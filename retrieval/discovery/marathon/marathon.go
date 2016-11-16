@@ -47,9 +47,9 @@ const (
 	taskLabel model.LabelName = metaLabelPrefix + "task"
 
 	// default port index for metrics collection
-	metricsListenerDefaultPortIndex = 0
+	metricsEndpointDefaultPortIndex = 0
 	// default path for metrics collection
-	metricsListenerDefaultPath = "/metrics"
+	metricsEndpointDefaultPath = "/metrics"
 
 	// Constants for instrumentation.
 	namespace = "prometheus"
@@ -69,8 +69,8 @@ var (
 			Help:      "The duration of a Marathon-SD refresh in seconds.",
 		})
 
-	// metricsListener validation regex, for the value it points to
-	metricsListenerValidation = regexp.MustCompile("^:([0-9]{1,1})(/[a-zA-Z0-9_]*)$")
+	// metricsEndpointEnvValue validation regex, for the value it points to in the app's ENV map
+	metricsEndpointValueValidation = regexp.MustCompile("^:([0-9]{1,1})(/[a-zA-Z0-9_]*)$")
 )
 
 func init() {
@@ -79,16 +79,15 @@ func init() {
 }
 
 const appListPath string = "/v2/apps/?embed=apps.tasks"
-const metricsListenerDefault string = ":0/"
 
 // Discovery provides service discovery based on a Marathon instance.
 type Discovery struct {
-	client          *http.Client
-	servers         []string
-	refreshInterval time.Duration
-	lastRefresh     map[string]*config.TargetGroup
-	appsClient      AppListClient
-	metricsListener string
+	client                *http.Client
+	servers               []string
+	refreshInterval       time.Duration
+	lastRefresh           map[string]*config.TargetGroup
+	appsClient            AppListClient
+	metricsEndpointEnvKey string
 }
 
 // Initialize sets up the discovery for usage.
@@ -106,11 +105,11 @@ func NewDiscovery(conf *config.MarathonSDConfig) (*Discovery, error) {
 	}
 
 	return &Discovery{
-		client:          client,
-		servers:         conf.Servers,
-		refreshInterval: time.Duration(conf.RefreshInterval),
-		appsClient:      fetchApps,
-		metricsListener: conf.MetricsListener,
+		client:                client,
+		servers:               conf.Servers,
+		refreshInterval:       time.Duration(conf.RefreshInterval),
+		appsClient:            fetchApps,
+		metricsEndpointEnvKey: conf.MetricsEndpoint,
 	}, nil
 }
 
@@ -175,12 +174,12 @@ func (md *Discovery) updateServices(ctx context.Context, ch chan<- []*config.Tar
 
 func (md *Discovery) fetchTargetGroups() (map[string]*config.TargetGroup, error) {
 	url := RandomAppsURL(md.servers)
-	apps, err := md.appsClient(md.client, url, md.metricsListener)
+	apps, err := md.appsClient(md.client, url, md.metricsEndpointEnvKey)
 	if err != nil {
 		return nil, err
 	}
 
-	groups := AppsToTargetGroups(apps, md.metricsListener)
+	groups := AppsToTargetGroups(apps, md.metricsEndpointEnvKey)
 	return groups, nil
 }
 
@@ -217,10 +216,10 @@ type AppList struct {
 }
 
 // AppListClient defines a function that can be used to get an application list from marathon.
-type AppListClient func(client *http.Client, url, metricsListener string) (*AppList, error)
+type AppListClient func(client *http.Client, url, metricsEndpointEnvKey string) (*AppList, error)
 
 // fetchApps requests a list of applications from a marathon server.
-func fetchApps(client *http.Client, url, metricsListener string) (*AppList, error) {
+func fetchApps(client *http.Client, url, metricsEndpointEnvKey string) (*AppList, error) {
 	resp, err := client.Get(url)
 	if err != nil {
 		return nil, err
@@ -236,23 +235,23 @@ func fetchApps(client *http.Client, url, metricsListener string) (*AppList, erro
 		return nil, err
 	}
 
-	// If no metricsListener value is configured, return the raw list immediately
-	if metricsListener == "" {
+	// If no metricsEndpointEnvKey value is configured, return the raw list immediately
+	if metricsEndpointEnvKey == "" {
 		return rawAppList, nil
 	}
 
 	curatedAppList := make([]App, 0)
-	// Make sure we only return apps which have a valid metricsListener ENV var present
+	// Make sure we only return apps which have a valid metricsEndpointEnvKey ENV var present
 	for _, app := range rawAppList.Apps {
-		// Check if metricsListener points to a valid ENV key
-		if _, ok := app.Env[metricsListener]; !ok {
+		// Check if metricsEndpointEnvKey points to a valid ENV key
+		if _, ok := app.Env[metricsEndpointEnvKey]; !ok {
 			continue
 		}
 
 		// Check that ENV key contains a valid value
-		reMatch := metricsListenerValidation.MatchString(app.Env[metricsListener])
+		reMatch := metricsEndpointValueValidation.MatchString(app.Env[metricsEndpointEnvKey])
 		if !reMatch {
-			log.Warnf("skipping '%s' because of invalid metricsListener ENV value: %s", app.Env[metricsListener])
+			log.Warnf("skipping '%s' because of invalid metricsEndpointEnvKey ENV value: %s", app.Env[metricsEndpointEnvKey])
 			continue
 		}
 		curatedAppList = append(curatedAppList, app)
@@ -278,18 +277,18 @@ func RandomAppsURL(servers []string) string {
 }
 
 // AppsToTargetGroups takes an array of Marathon apps and converts them into target groups.
-func AppsToTargetGroups(apps *AppList, metricsListener string) map[string]*config.TargetGroup {
+func AppsToTargetGroups(apps *AppList, metricsEndpointEnvKey string) map[string]*config.TargetGroup {
 	tgroups := map[string]*config.TargetGroup{}
 	for _, a := range apps.Apps {
-		group := createTargetGroup(&a, metricsListener)
+		group := createTargetGroup(&a, metricsEndpointEnvKey)
 		tgroups[group.Source] = group
 	}
 	return tgroups
 }
 
-func createTargetGroup(app *App, metricsListener string) *config.TargetGroup {
+func createTargetGroup(app *App, metricsEndpointEnvKey string) *config.TargetGroup {
 	var (
-		targets = targetsForApp(app, metricsListener)
+		targets = targetsForApp(app, metricsEndpointEnvKey)
 		appName = model.LabelValue(app.ID)
 		image   = model.LabelValue(app.Container.Docker.Image)
 	)
@@ -310,16 +309,14 @@ func createTargetGroup(app *App, metricsListener string) *config.TargetGroup {
 	return tg
 }
 
-func targetsForApp(app *App, metricsListener string) []model.LabelSet {
+func targetsForApp(app *App, metricsEndpointEnvKey string) []model.LabelSet {
 	targets := make([]model.LabelSet, 0, len(app.Tasks))
 
-	metricsPortIndex := metricsListenerDefaultPortIndex
-	metricsPath := metricsListenerDefaultPath
+	metricsPortIndex := metricsEndpointDefaultPortIndex
+	metricsPath := metricsEndpointDefaultPath
 
-	if metricsListener != "" {
-		metricsListenerValue := app.Env[metricsListener]
-		regexSubMatches := metricsListenerValidation.FindStringSubmatch(metricsListenerValue)
-
+	if metricsEndpointEnvKey != "" {
+		regexSubMatches := metricsEndpointValueValidation.FindStringSubmatch(app.Env[metricsEndpointEnvKey])
 		metricsPortIndex, _ = strconv.Atoi(regexSubMatches[1])
 		metricsPath = regexSubMatches[2]
 	}
